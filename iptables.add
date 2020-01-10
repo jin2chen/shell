@@ -1,0 +1,104 @@
+#!/bin/bash
+set -e
+
+function waitTun() {
+    for i in {1..20}; do
+        if ip link | grep -P "^\d+: $OPENVPN_DEVICE:" &> /dev/null; then
+            return 0
+        else
+            sleep 1
+        fi
+    done
+
+    echo 'tun is not up.'
+    return 1
+}
+
+# Variables
+BASE_DIR=$(cd $(dirname $0) && pwd)
+ROUTE_FILE=/opt/etc/route.txt
+SS_SERVER=47.75.207.24
+RT_ID=200
+IPSET_NAME=CHINA
+OPENVPN_DEVICE=tun0
+waitTun
+OPENVPN_REMOTE_IP=$(ip address show $OPENVPN_DEVICE | grep -oP 'inet [\d.]+ peer \K[\d.]+')
+
+# This is very important
+sysctl -w net.ipv4.ip_forward=1 &> /dev/null
+sysctl -w net.ipv4.conf.all.rp_filter=0 &> /dev/null
+sysctl -w net.ipv4.conf.$OPENVPN_DEVICE.rp_filter=0 &> /dev/null
+# For DNS DNAT
+sysctl -w net.ipv4.conf.eth0.route_localnet=1
+
+# Add route table
+ip rule add fwmark 1 table $RT_ID
+ip route flush table $RT_ID
+ip route add table $RT_ID default via $OPENVPN_REMOTE_IP dev $OPENVPN_DEVICE
+ip route flush cache
+
+ipset -exist create $IPSET_NAME hash:net
+ipset flush $IPSET_NAME
+BYPASS_RESERVED_IPS=" \
+    $SS_SERVER \
+    0.0.0.0/8 \
+    10.0.0.0/8 \
+    127.0.0.0/8 \
+    169.254.0.0/16 \
+    172.16.0.0/12 \
+    192.168.0.0/16 \
+    224.0.0.0/4 \
+    240.0.0.0/4 \
+"
+
+for line in $BYPASS_RESERVED_IPS; do
+    ipset add $IPSET_NAME $line
+done
+
+if [ -f $ROUTE_FILE ]; then
+   egrep -v "^#|^$" $ROUTE_FILE | sed -e "s/^/add $IPSET_NAME /" | ipset -exist restore
+fi
+
+# Clean iptables
+# For debug
+iptables-save | awk '/^[*]/ { print $1 } /^:[A-Z]+ [^-]/ { print $1 " ACCEPT" ; } /COMMIT/ { print $0; }' | iptables-restore
+
+# Create new chain
+iptables -t mangle -N SHADOWSOCKS
+
+# Ignore your shadowsocks server's addresses
+# It's very IMPORTANT, just be careful.
+#iptables -t mangle -A SHADOWSOCKS -d $SS_SERVER -j RETURN # SS server
+
+# Ignore LANs and any other addresses you'd like to bypass the proxy
+# See Wikipedia and RFC5735 for full list of reserved networks.
+# See ashi009/bestroutetb for a highly optimized CHN route list.
+#iptables -t mangle -A SHADOWSOCKS -d 0.0.0.0/8 -j RETURN
+#iptables -t mangle -A SHADOWSOCKS -d 10.0.0.0/8 -j RETURN
+#iptables -t mangle -A SHADOWSOCKS -d 127.0.0.0/8 -j RETURN
+#iptables -t mangle -A SHADOWSOCKS -d 169.254.0.0/16 -j RETURN
+#iptables -t mangle -A SHADOWSOCKS -d 172.16.0.0/12 -j RETURN
+#iptables -t mangle -A SHADOWSOCKS -d 192.168.0.0/16 -j RETURN
+#iptables -t mangle -A SHADOWSOCKS -d 224.0.0.0/4 -j RETURN
+#iptables -t mangle -A SHADOWSOCKS -d 240.0.0.0/4 -j RETURN
+#iptables -t mangle -A SHADOWSOCKS -m geoip --dst-cc CN -j RETURN
+iptables -t mangle -A SHADOWSOCKS -m set --match-set $IPSET_NAME dst -j RETURN
+# For IPSec
+#iptables -t mangle -A SHADOWSOCKS -p udp -m multiport --sports 500,4500 -m state --state RELATED,ESTABLISHED -j RETURN
+iptables -t mangle -A SHADOWSOCKS -p udp -m multiport --sports 500,4500 -j RETURN
+# Anything else should be go to openvpn.
+iptables -t mangle -A SHADOWSOCKS -j MARK --set-mark 1
+
+# Apply the rules
+iptables -t mangle -A PREROUTING -j SHADOWSOCKS
+iptables -t mangle -A OUTPUT -j SHADOWSOCKS
+
+# All package out from openvpn device, SNAT
+iptables -t nat -A POSTROUTING -o $OPENVPN_DEVICE -j MASQUERADE
+# For IPSec
+iptables -t nat -A POSTROUTING -s 10.10.10.0/24 -o eth0 -j MASQUERADE
+# For DNS DNAT
+iptables -t nat -A PREROUTING -d 10.10.10.1 -j DNAT --to-destination 127.0.0.1
+
+exit 0
+
